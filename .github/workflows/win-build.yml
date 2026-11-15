@@ -201,6 +201,14 @@ jobs:
           install -m 755 /tmp/coscli /usr/local/bin/coscli
           COS=(coscli --disable-log -i "$COS_SECRET_ID" -k "$COS_SECRET_KEY" -e "cos.$COS_REGION.myqcloud.com")
           B="cos://$COS_BUCKET"
+          # release.win.json：下载页运行时版本指针（version/file/size/sha256），
+          # 先挂进 release 资产——本地镜像兜底随之获得它，且计入 EXPECT 不被清理。
+          F="rel/Mino-Setup-$VERSION.exe"
+          printf '{\n  "version": "%s",\n  "file": "%s",\n  "size": %s,\n  "sha256": "%s"\n}\n' \
+            "$VERSION" "$(basename "$F")" "$(stat -c%s "$F")" \
+            "$(sha256sum "$F" | cut -d" " -f1)" > "rel/release.win.json"
+          gh release upload "v$VERSION" "rel/release.win.json" --clobber \
+            --repo ${{ github.repository }}
           # 键映射与 mino-deploy sync-release-assets.sh 的 cos_keys_for 一致：
           # feeds/<platform>/ 给更新器，desktop/ 给官网按钮。
           cos_keys_for() {
@@ -212,6 +220,7 @@ jobs:
               Mino-Setup-*.dmg)  echo "desktop/$1" ;;
               Mino-Setup-*)      echo "dsh-desk/feeds/win-x64/$1 desktop/$1" ;;
               *-mac-arm64-*)     echo "dsh-desk/feeds/mac-arm64/$1" ;;
+              release.*.json)    echo "desktop/$1" ;;
               *)                 return 1 ;;
             esac
           }
