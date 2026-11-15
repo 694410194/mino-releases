@@ -226,7 +226,7 @@ jobs:
           }
           # 期望键集按整份 release 资产算（本 workflow 的 rel/ 只有本平台一半，
           # 按 rel/ 算会把另一平台的键当过期对象删掉）。
-          declare -A EXPECT
+          declare -A EXPECT PUSHED
           while IFS= read -r a; do
             keys=$(cos_keys_for "$a") || continue
             for k in $keys; do EXPECT["$k"]=1; done
@@ -239,6 +239,7 @@ jobs:
             cos_keys_for "$base" >/dev/null || { echo "推桶跳过 $base"; continue; }
             for k in $(cos_keys_for "$base"); do
               "${COS[@]}" cp "$f" "$B/$k" >/dev/null
+              PUSHED["$k"]=1
               echo "cos <- $k"
             done
           done
@@ -247,9 +248,18 @@ jobs:
             cos_keys_for "$base" >/dev/null || { echo "推桶跳过 $base"; continue; }
             for k in $(cos_keys_for "$base"); do
               "${COS[@]}" cp "$f" "$B/$k" >/dev/null
+              PUSHED["$k"]=1
               echo "cos <- $k"
             done
           done
+          # 推后必验：coscli cp 在端点指错时也会“成功”但键查无对象（实测坑）——
+          # 对本 workflow 实际推过的键逐个 stat（验 PUSHED 而非 EXPECT——两平台并发推各自一半，
+          # 验 EXPECT 会把对方尚未推送误判为失败），缺一个立即失败，不带缺键进清理/刷缓存。
+          MISSING=0
+          for k in "${!PUSHED[@]}"; do
+            "${COS[@]}" stat "$B/$k" >/dev/null 2>&1 || { echo "cos 缺键 $k" >&2; MISSING=1; }
+          done
+          [ "$MISSING" -eq 0 ] || exit 1
           # 远端清理：删不在本版键集的对象（上一版安装包），沿用 MAX_PRUNE 闸。
           MAX_PRUNE=10
           RPRUNE=()
