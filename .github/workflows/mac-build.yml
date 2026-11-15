@@ -189,3 +189,85 @@ jobs:
             [ "$got" = "${WANT[$name]}" ] || { echo "digest mismatch: $name"; exit 1; }
           done
           gh release edit "$TAG" --draft=false
+
+      - name: push release assets to COS and purge feed cache
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COS_SECRET_ID: ${{ secrets.COS_SECRET_ID }}
+          COS_SECRET_KEY: ${{ secrets.COS_SECRET_KEY }}
+          COS_BUCKET: ${{ vars.COS_BUCKET }}
+          COS_REGION: ${{ vars.COS_REGION }}
+          COSCLI_SHA256: a07de5ba2800147a700ed29036b0c76a4229088cee68e1682d0eae19b638a915
+        run: |
+          set -euo pipefail
+          # coscli 与服务器同版同哈希（tencentyun/coscli 官方 v1.0.9 linux-amd64）。
+          curl -fsSL -o /tmp/coscli \
+            https://github.com/tencentyun/coscli/releases/download/v1.0.9/coscli-v1.0.9-linux-amd64
+          echo "$COSCLI_SHA256  /tmp/coscli" | sha256sum -c -
+          install -m 755 /tmp/coscli /usr/local/bin/coscli
+          COS=(coscli --disable-log -i "$COS_SECRET_ID" -k "$COS_SECRET_KEY" -e "cos.$COS_REGION.myqcloud.com")
+          B="cos://$COS_BUCKET"
+          # 键映射与 mino-deploy sync-release-assets.sh 的 cos_keys_for 一致：
+          # feeds/<platform>/ 给更新器，desktop/ 给官网按钮。
+          cos_keys_for() {
+            case "$1" in
+              stable.yml)        echo "dsh-desk/feeds/win-x64/stable.yml dsh-desk/feeds/win-x64/latest.yml" ;;
+              nightly.yml)       echo "dsh-desk/feeds/win-x64/nightly.yml" ;;
+              stable-mac.yml)    echo "dsh-desk/feeds/mac-arm64/stable-mac.yml dsh-desk/feeds/mac-arm64/latest-mac.yml" ;;
+              nightly-mac.yml)   echo "dsh-desk/feeds/mac-arm64/nightly-mac.yml" ;;
+              Mino-Setup-*.dmg)  echo "desktop/$1" ;;
+              Mino-Setup-*)      echo "dsh-desk/feeds/win-x64/$1 desktop/$1" ;;
+              *-mac-arm64-*)     echo "dsh-desk/feeds/mac-arm64/$1" ;;
+              *)                 return 1 ;;
+            esac
+          }
+          # 期望键集按整份 release 资产算（本 workflow 的 rel/ 只有本平台一半，
+          # 按 rel/ 算会把另一平台的键当过期对象删掉）。
+          declare -A EXPECT
+          while IFS= read -r a; do
+            keys=$(cos_keys_for "$a") || continue
+            for k in $keys; do EXPECT["$k"]=1; done
+          done < <(gh release view "v$VERSION" --repo ${{ github.repository }} --json assets \
+            --jq '.assets[].name')
+          # 二进制先推、通道 yml 最后推——更新器永远读不到指向缺失二进制的 feed。
+          for f in rel/*; do
+            base=$(basename "$f")
+            [[ "$base" == *.yml ]] && continue
+            cos_keys_for "$base" >/dev/null || { echo "推桶跳过 $base"; continue; }
+            for k in $(cos_keys_for "$base"); do
+              "${COS[@]}" cp "$f" "$B/$k" >/dev/null
+              echo "cos <- $k"
+            done
+          done
+          for f in rel/*.yml; do
+            base=$(basename "$f")
+            cos_keys_for "$base" >/dev/null || { echo "推桶跳过 $base"; continue; }
+            for k in $(cos_keys_for "$base"); do
+              "${COS[@]}" cp "$f" "$B/$k" >/dev/null
+              echo "cos <- $k"
+            done
+          done
+          # 远端清理：删不在本版键集的对象（上一版安装包），沿用 MAX_PRUNE 闸。
+          MAX_PRUNE=10
+          RPRUNE=()
+          while IFS= read -r obj; do
+            [ -z "$obj" ] && continue
+            [ -z "${EXPECT[$obj]:-}" ] && RPRUNE+=("$obj")
+          done < <("${COS[@]}" ls "$B/" -r \
+            | awk -F'|' '/\| FILE \|/ {gsub(/^ +| +$/,"",$1); print $1}')
+          if (( ${#RPRUNE[@]} > MAX_PRUNE )); then
+            echo "桶内过期对象数 ${#RPRUNE[@]} 超过 MAX_PRUNE=$MAX_PRUNE，未删除：" >&2
+            printf '  %s\n' "${RPRUNE[@]}" >&2
+            exit 1
+          fi
+          for obj in "${RPRUNE[@]}"; do
+            "${COS[@]}" rm "$B/$obj" -f >/dev/null || true
+            echo "cos rm $obj"
+          done
+          # feeds 边缘缓存不随 1s TTL 可靠过期（v0.2.10 实测整组停在 0.2.9）——必须主动刷。
+          python3 -m pip install -q "tccli==3.1.200.1"
+          tccli configure set secretId "$COS_SECRET_ID" secretKey "$COS_SECRET_KEY" region "$COS_REGION" >/dev/null
+          URLS=$(printf '"https://download.mino.baby/%s",' "${!EXPECT[@]}" | sed 's/,$//')
+          tccli cdn PurgeUrlsCache --Urls "[$URLS]"
+          echo "COS push done: ${#EXPECT[@]} keys, ${#RPRUNE[@]} pruned"
