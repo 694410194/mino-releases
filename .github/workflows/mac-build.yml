@@ -181,8 +181,10 @@ jobs:
           for f in rel/*; do WANT["$(basename "$f")"]=$(sha256sum "$f" | cut -d' ' -f1); done
           for f in rel/*; do gh release upload "$TAG" "$f" --clobber; done
           sleep 5
+          REL_ID=$(gh api "repos/${{ github.repository }}/releases?per_page=30" \
+            --jq ".[] | select(.tag_name==\"$TAG\") | .id")
           for name in "${!WANT[@]}"; do
-            got=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" \
+            got=$(gh api "repos/${{ github.repository }}/releases/$REL_ID" \
               --jq ".assets[] | select(.name==\"$name\") | .digest" | sed 's/sha256://')
             [ "$got" = "${WANT[$name]}" ] || { echo "digest mismatch: $name"; exit 1; }
           done
