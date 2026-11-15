@@ -1,0 +1,35 @@
+name: cos-push-test
+
+# cos-publish.yml 的无构建演练入口：对既有 release 版本实跑同一条
+# 下载→digest 校验→推桶→逐键 stat→分域剪枝→刷 CDN 链路。
+# 幂等设计——对已发布版本重放是安全的（同内容覆盖、EXPECT 覆盖全键、剪枝为空）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '对哪个已发布版本重放（如 0.2.10）'
+        required: true
+        type: string
+      platform:
+        description: '按哪个平台域执行（剪枝分域）'
+        required: true
+        type: choice
+        options: [win, mac]
+        default: win
+      full:
+        description: 'true=整份资产（~900MB 全链）；false=仅本平台资产'
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  cos-push:
+    uses: ./.github/workflows/cos-publish.yml
+    permissions:
+      contents: write
+    with:
+      version: ${{ inputs.version }}
+      platform: ${{ inputs.platform }}
+      full: ${{ inputs.full }}
+    secrets: inherit

@@ -1,0 +1,175 @@
+name: cos-publish
+
+# 桌面发布资产 → 私有 COS（CDN 回源）的可复用发布作业。
+# win-build / mac-build 的 publish 之后调用本 workflow；cos-push-test 可无构建独立演练。
+# 语义：以 release 资产清单为准做镜像同步——下载+digest 校验→推桶（二进制先、yml 后）
+# →逐键 stat 断言→按本平台分域剪枝旧版→PurgeUrlsCache 刷 feed。幂等，可重跑。
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: '发布版本号（v<version> release 的资产）'
+        required: true
+        type: string
+      platform:
+        description: 'win=feeds/win-x64+desktop/*.exe*+release.win.json；mac=feeds/mac-arm64+desktop/*.dmg+release.mac.json'
+        required: true
+        type: string
+      full:
+        description: 'true=下载并推送整份 release 资产（跨平台完整演练）；false=仅本平台子集'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  cos-push:
+    # 同平台串行（防双发剪枝互踩）；win/mac 并发安全——剪枝按平台前缀分域。
+    concurrency: cos-publish-${{ inputs.platform }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+      PLATFORM: ${{ inputs.platform }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      COS_SECRET_ID: ${{ secrets.COS_SECRET_ID }}
+      COS_SECRET_KEY: ${{ secrets.COS_SECRET_KEY }}
+      COS_BUCKET: ${{ vars.COS_BUCKET }}
+      COS_REGION: ${{ vars.COS_REGION }}
+      COSCLI_SHA256: a07de5ba2800147a700ed29036b0c76a4229088cee68e1682d0eae19b638a915
+    steps:
+      - name: download and digest-verify release assets
+        run: |
+          set -euo pipefail
+          # 以 release 资产为权威源，不依赖上游作业暂存——digest 逐字节校验保证所推即所签。
+          mkdir -p rel
+          PATTERNS=(--pattern 'release.*.json')
+          case "$PLATFORM" in
+            win) PATTERNS+=(--pattern 'Mino-Setup-*.exe' --pattern 'Mino-Setup-*.exe.blockmap' --pattern 'stable.yml' --pattern 'nightly.yml') ;;
+            mac) PATTERNS+=(--pattern 'Mino-Setup-*.dmg' --pattern 'mino-*-mac-arm64-*.zip' --pattern 'mino-*-mac-arm64-*.zip.blockmap' --pattern 'stable-mac.yml' --pattern 'nightly-mac.yml') ;;
+            *) echo "platform 只认 win|mac，实收 $PLATFORM" >&2; exit 1 ;;
+          esac
+          if [ "${{ inputs.full }}" = "true" ]; then
+            gh release download "v$VERSION" --repo ${{ github.repository }} --dir rel --clobber
+          else
+            gh release download "v$VERSION" --repo ${{ github.repository }} --dir rel --clobber "${PATTERNS[@]}"
+          fi
+          # GitHub API 资产记录自带 sha256 digest——逐文件校验后才允许进桶。
+          FAIL=0
+          while IFS=' ' read -r name digest; do
+            [ -f "rel/$name" ] || continue
+            want=${digest#sha256:}
+            [ "$want" != "$digest" ] || { echo "资产 $name 无 sha256 digest" >&2; FAIL=1; continue; }
+            got=$(sha256sum "rel/$name" | cut -d' ' -f1)
+            [ "$got" = "$want" ] || { echo "digest 不符 $name" >&2; FAIL=1; }
+          done < <(gh api "repos/${{ github.repository }}/releases/tags/v$VERSION" \
+                     --jq '.assets[] | .name + " " + .digest')
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo "digest 校验通过：$(ls rel | wc -l) 个资产"
+
+      - name: generate release.<platform>.json version pointer
+        run: |
+          set -euo pipefail
+          case "$PLATFORM" in
+            win) F="rel/Mino-Setup-$VERSION.exe" ;;
+            mac) F="rel/Mino-Setup-$VERSION.dmg" ;;
+          esac
+          printf '{\n  "version": "%s",\n  "file": "%s",\n  "size": %s,\n  "sha256": "%s"\n}\n' \
+            "$VERSION" "$(basename "$F")" "$(stat -c%s "$F")" \
+            "$(sha256sum "$F" | cut -d' ' -f1)" > "rel/release.$PLATFORM.json"
+          gh release upload "v$VERSION" "rel/release.$PLATFORM.json" --clobber \
+            --repo ${{ github.repository }}
+
+      - name: push to COS and purge feed cache
+        run: |
+          set -euo pipefail
+          # coscli 与服务器同版同哈希（tencentyun/coscli 官方 v1.0.9 linux-amd64）。
+          curl -fsSL -o /tmp/coscli \
+            https://github.com/tencentyun/coscli/releases/download/v1.0.9/coscli-v1.0.9-linux-amd64
+          echo "$COSCLI_SHA256  /tmp/coscli" | sha256sum -c -
+          install -m 755 /tmp/coscli /usr/local/bin/coscli
+          COS=(coscli --disable-log -i "$COS_SECRET_ID" -k "$COS_SECRET_KEY" -e "cos.$COS_REGION.myqcloud.com")
+          B="cos://$COS_BUCKET"
+          # 键映射与 mino-deploy sync-release-assets.sh 的 cos_keys_for 一致：
+          # feeds/<platform>/ 给更新器，desktop/ 给官网按钮。
+          cos_keys_for() {
+            case "$1" in
+              stable.yml)        echo "dsh-desk/feeds/win-x64/stable.yml dsh-desk/feeds/win-x64/latest.yml" ;;
+              nightly.yml)       echo "dsh-desk/feeds/win-x64/nightly.yml" ;;
+              stable-mac.yml)    echo "dsh-desk/feeds/mac-arm64/stable-mac.yml dsh-desk/feeds/mac-arm64/latest-mac.yml" ;;
+              nightly-mac.yml)   echo "dsh-desk/feeds/mac-arm64/nightly-mac.yml" ;;
+              Mino-Setup-*.dmg)  echo "desktop/$1" ;;
+              Mino-Setup-*)      echo "dsh-desk/feeds/win-x64/$1 desktop/$1" ;;
+              *-mac-arm64-*)     echo "dsh-desk/feeds/mac-arm64/$1" ;;
+              release.*.json)    echo "desktop/$1" ;;
+              *)                 return 1 ;;
+            esac
+          }
+          # 剪枝所有权：本平台才许删本平台键——并发双 workflow 时，对方旧版资产
+          # 即使不在本版 EXPECT 也不得由本侧删除（否则把对端 feed 所指文件抽走）。
+          owns_key() {
+            case "$PLATFORM:$1" in
+              win:dsh-desk/feeds/win-x64/*|win:desktop/Mino-Setup-*.exe*|win:desktop/release.win.json) return 0 ;;
+              mac:dsh-desk/feeds/mac-arm64/*|mac:desktop/*.dmg|mac:desktop/release.mac.json)           return 0 ;;
+            esac
+            return 1
+          }
+          # 期望键集按整份 release 资产算。
+          declare -A EXPECT PUSHED
+          while IFS= read -r a; do
+            keys=$(cos_keys_for "$a") || continue
+            for k in $keys; do EXPECT["$k"]=1; done
+          done < <(gh api "repos/${{ github.repository }}/releases/tags/v$VERSION" \
+                     --jq '.assets[].name')
+          # 二进制先推、通道 yml 最后推——更新器永远读不到指向缺失二进制的 feed。
+          for f in rel/*; do
+            base=$(basename "$f")
+            [[ "$base" == *.yml ]] && continue
+            cos_keys_for "$base" >/dev/null || { echo "推桶跳过 $base"; continue; }
+            for k in $(cos_keys_for "$base"); do
+              "${COS[@]}" cp "$f" "$B/$k" >/dev/null
+              PUSHED["$k"]=1
+              echo "cos <- $k"
+            done
+          done
+          for f in rel/*.yml; do
+            base=$(basename "$f")
+            cos_keys_for "$base" >/dev/null || { echo "推桶跳过 $base"; continue; }
+            for k in $(cos_keys_for "$base"); do
+              "${COS[@]}" cp "$f" "$B/$k" >/dev/null
+              PUSHED["$k"]=1
+              echo "cos <- $k"
+            done
+          done
+          # 推后必验：coscli cp 在端点指错时也会"成功"但键查无对象（实测坑）。
+          MISSING=0
+          for k in "${!PUSHED[@]}"; do
+            "${COS[@]}" stat "$B/$k" >/dev/null 2>&1 || { echo "cos 缺键 $k" >&2; MISSING=1; }
+          done
+          [ "$MISSING" -eq 0 ] || exit 1
+          # 远端清理：只删本平台域内、且不在本版键集的对象，沿用 MAX_PRUNE 闸。
+          MAX_PRUNE=10
+          RPRUNE=()
+          while IFS= read -r obj; do
+            [ -z "$obj" ] && continue
+            [ -n "${EXPECT[$obj]:-}" ] && continue
+            owns_key "$obj" || continue
+            RPRUNE+=("$obj")
+          done < <("${COS[@]}" ls "$B/" -r \
+            | awk -F'|' '/\| FILE \|/ {gsub(/^ +| +$/,"",$1); print $1}')
+          if (( ${#RPRUNE[@]} > MAX_PRUNE )); then
+            echo "本平台域内过期对象数 ${#RPRUNE[@]} 超过 MAX_PRUNE=$MAX_PRUNE，未删除：" >&2
+            printf '  %s\n' "${RPRUNE[@]}" >&2
+            exit 1
+          fi
+          for obj in "${RPRUNE[@]}"; do
+            "${COS[@]}" rm "$B/$obj" -f >/dev/null || true
+            echo "cos rm $obj"
+          done
+          # feeds 边缘缓存不随 1s TTL 可靠过期（v0.2.10 实测整组停在 0.2.9）——必须主动刷。
+          python3 -m pip install -q "tccli==3.1.200.1"
+          tccli configure set secretId "$COS_SECRET_ID" secretKey "$COS_SECRET_KEY" region "$COS_REGION" >/dev/null
+          URLS=$(printf '"https://download.mino.baby/%s",' "${!EXPECT[@]}" | sed 's/,$//')
+          tccli cdn PurgeUrlsCache --Urls "[$URLS]"
+          echo "COS push done: pushed ${#PUSHED[@]} keys, pruned ${#RPRUNE[@]}"

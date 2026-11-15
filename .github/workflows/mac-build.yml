@@ -190,103 +190,15 @@ jobs:
           done
           gh release edit "$TAG" --draft=false
 
-      - name: push release assets to COS and purge feed cache
-        env:
-          VERSION: ${{ inputs.version }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COS_SECRET_ID: ${{ secrets.COS_SECRET_ID }}
-          COS_SECRET_KEY: ${{ secrets.COS_SECRET_KEY }}
-          COS_BUCKET: ${{ vars.COS_BUCKET }}
-          COS_REGION: ${{ vars.COS_REGION }}
-          COSCLI_SHA256: a07de5ba2800147a700ed29036b0c76a4229088cee68e1682d0eae19b638a915
-        run: |
-          set -euo pipefail
-          # coscli 与服务器同版同哈希（tencentyun/coscli 官方 v1.0.9 linux-amd64）。
-          curl -fsSL -o /tmp/coscli \
-            https://github.com/tencentyun/coscli/releases/download/v1.0.9/coscli-v1.0.9-linux-amd64
-          echo "$COSCLI_SHA256  /tmp/coscli" | sha256sum -c -
-          install -m 755 /tmp/coscli /usr/local/bin/coscli
-          COS=(coscli --disable-log -i "$COS_SECRET_ID" -k "$COS_SECRET_KEY" -e "cos.$COS_REGION.myqcloud.com")
-          B="cos://$COS_BUCKET"
-          # release.mac.json：下载页运行时版本指针（version/file/size/sha256），
-          # 先挂进 release 资产——本地镜像兜底随之获得它，且计入 EXPECT 不被清理。
-          F="rel/Mino-Setup-$VERSION.dmg"
-          printf '{\n  "version": "%s",\n  "file": "%s",\n  "size": %s,\n  "sha256": "%s"\n}\n' \
-            "$VERSION" "$(basename "$F")" "$(stat -c%s "$F")" \
-            "$(sha256sum "$F" | cut -d" " -f1)" > "rel/release.mac.json"
-          gh release upload "v$VERSION" "rel/release.mac.json" --clobber \
-            --repo ${{ github.repository }}
-          # 键映射与 mino-deploy sync-release-assets.sh 的 cos_keys_for 一致：
-          # feeds/<platform>/ 给更新器，desktop/ 给官网按钮。
-          cos_keys_for() {
-            case "$1" in
-              stable.yml)        echo "dsh-desk/feeds/win-x64/stable.yml dsh-desk/feeds/win-x64/latest.yml" ;;
-              nightly.yml)       echo "dsh-desk/feeds/win-x64/nightly.yml" ;;
-              stable-mac.yml)    echo "dsh-desk/feeds/mac-arm64/stable-mac.yml dsh-desk/feeds/mac-arm64/latest-mac.yml" ;;
-              nightly-mac.yml)   echo "dsh-desk/feeds/mac-arm64/nightly-mac.yml" ;;
-              Mino-Setup-*.dmg)  echo "desktop/$1" ;;
-              Mino-Setup-*)      echo "dsh-desk/feeds/win-x64/$1 desktop/$1" ;;
-              *-mac-arm64-*)     echo "dsh-desk/feeds/mac-arm64/$1" ;;
-              release.*.json)    echo "desktop/$1" ;;
-              *)                 return 1 ;;
-            esac
-          }
-          # 期望键集按整份 release 资产算（本 workflow 的 rel/ 只有本平台一半，
-          # 按 rel/ 算会把另一平台的键当过期对象删掉）。
-          declare -A EXPECT PUSHED
-          while IFS= read -r a; do
-            keys=$(cos_keys_for "$a") || continue
-            for k in $keys; do EXPECT["$k"]=1; done
-          done < <(gh release view "v$VERSION" --repo ${{ github.repository }} --json assets \
-            --jq '.assets[].name')
-          # 二进制先推、通道 yml 最后推——更新器永远读不到指向缺失二进制的 feed。
-          for f in rel/*; do
-            base=$(basename "$f")
-            [[ "$base" == *.yml ]] && continue
-            cos_keys_for "$base" >/dev/null || { echo "推桶跳过 $base"; continue; }
-            for k in $(cos_keys_for "$base"); do
-              "${COS[@]}" cp "$f" "$B/$k" >/dev/null
-              PUSHED["$k"]=1
-              echo "cos <- $k"
-            done
-          done
-          for f in rel/*.yml; do
-            base=$(basename "$f")
-            cos_keys_for "$base" >/dev/null || { echo "推桶跳过 $base"; continue; }
-            for k in $(cos_keys_for "$base"); do
-              "${COS[@]}" cp "$f" "$B/$k" >/dev/null
-              PUSHED["$k"]=1
-              echo "cos <- $k"
-            done
-          done
-          # 推后必验：coscli cp 在端点指错时也会“成功”但键查无对象（实测坑）——
-          # 对本 workflow 实际推过的键逐个 stat（验 PUSHED 而非 EXPECT——两平台并发推各自一半，
-          # 验 EXPECT 会把对方尚未推送误判为失败），缺一个立即失败，不带缺键进清理/刷缓存。
-          MISSING=0
-          for k in "${!PUSHED[@]}"; do
-            "${COS[@]}" stat "$B/$k" >/dev/null 2>&1 || { echo "cos 缺键 $k" >&2; MISSING=1; }
-          done
-          [ "$MISSING" -eq 0 ] || exit 1
-          # 远端清理：删不在本版键集的对象（上一版安装包），沿用 MAX_PRUNE 闸。
-          MAX_PRUNE=10
-          RPRUNE=()
-          while IFS= read -r obj; do
-            [ -z "$obj" ] && continue
-            [ -z "${EXPECT[$obj]:-}" ] && RPRUNE+=("$obj")
-          done < <("${COS[@]}" ls "$B/" -r \
-            | awk -F'|' '/\| FILE \|/ {gsub(/^ +| +$/,"",$1); print $1}')
-          if (( ${#RPRUNE[@]} > MAX_PRUNE )); then
-            echo "桶内过期对象数 ${#RPRUNE[@]} 超过 MAX_PRUNE=$MAX_PRUNE，未删除：" >&2
-            printf '  %s\n' "${RPRUNE[@]}" >&2
-            exit 1
-          fi
-          for obj in "${RPRUNE[@]}"; do
-            "${COS[@]}" rm "$B/$obj" -f >/dev/null || true
-            echo "cos rm $obj"
-          done
-          # feeds 边缘缓存不随 1s TTL 可靠过期（v0.2.10 实测整组停在 0.2.9）——必须主动刷。
-          python3 -m pip install -q "tccli==3.1.200.1"
-          tccli configure set secretId "$COS_SECRET_ID" secretKey "$COS_SECRET_KEY" region "$COS_REGION" >/dev/null
-          URLS=$(printf '"https://download.mino.baby/%s",' "${!EXPECT[@]}" | sed 's/,$//')
-          tccli cdn PurgeUrlsCache --Urls "[$URLS]"
-          echo "COS push done: ${#EXPECT[@]} keys, ${#RPRUNE[@]} pruned"
+  cos-publish:
+    # 发布后镜像到私有 COS+刷 CDN（去服务器 cron 后的分发面）。可复用实现见
+    # cos-publish.yml；cos-push-test 可无构建独立演练同一条代码路径。
+    needs: publish
+    if: inputs.publish
+    uses: ./.github/workflows/cos-publish.yml
+    permissions:
+      contents: write
+    with:
+      version: ${{ inputs.version }}
+      platform: mac
+    secrets: inherit
