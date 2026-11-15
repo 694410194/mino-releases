@@ -152,9 +152,13 @@ jobs:
           grep -qx "version: $VERSION" dist/stable.yml \
             || { echo "stable.yml 版本与输入不符，拒绝发布"; cat dist/stable.yml; exit 1; }
           mkdir rel
-          cp dist/*.exe "rel/Mino-Setup-${VERSION}.exe"
-          cp dist/*.blockmap dist/stable.yml rel/
-          cp dist/stable.yml rel/nightly.yml
+          SRC_NAME="mino-${VERSION}-win-x64-unsigned.exe"
+          grep -q "$SRC_NAME" dist/stable.yml \
+            || { echo "stable.yml 未引用 $SRC_NAME，文件名约定变了，请人工检查"; cat dist/stable.yml; exit 1; }
+          cp "dist/${SRC_NAME}" "rel/Mino-Setup-${VERSION}.exe"
+          cp "dist/${SRC_NAME}.blockmap" "rel/Mino-Setup-${VERSION}.exe.blockmap"
+          sed "s/${SRC_NAME//./\\.}/Mino-Setup-${VERSION}.exe/g" dist/stable.yml > rel/stable.yml
+          cp rel/stable.yml rel/nightly.yml
           ls -lh rel
 
       - name: upload assets and publish release
