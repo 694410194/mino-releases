@@ -1,0 +1,176 @@
+name: win-build
+# Mino Windows unsigned 发布构建——mino-deploy scripts/build-win-x64-release.sh 的 CI 版。
+# 与本仓 mac-build.yml 同一源码链：deploy key → 私仓备份（BASE+format-patch）→ 重建产品树。
+# 环境口径与本地脚本一致：ELECTRON_MIRROR / DSH_DESKTOP_UPDATE_CHANNEL=stable / MINO_PLUGINS_DIR
+# / .env.windows 前置闸（内容无非密配置，workflow 内联写入）。
+# 相对本机构建额外收益：无火绒进程树限制，不必树外 worktree。
+
+on:
+  workflow_dispatch:
+    inputs:
+      plugins_ref:
+        description: 'mino-plugins ref（分支或 commit）'
+        required: false
+        default: 'main'
+      publish:
+        description: '构建后把资产上传 v<version> release（同名覆盖）'
+        required: false
+        type: boolean
+        default: false
+      version:
+        description: '发布版本号（publish 时必填，须与产物版本一致）'
+        required: false
+        default: ''
+
+jobs:
+  win-x64-unsigned:
+    runs-on: windows-2025
+    timeout-minutes: 150
+    env:
+      ELECTRON_MIRROR: 'https://npmmirror.com/mirrors/electron/'
+      DSH_DESKTOP_UPDATE_CHANNEL: 'stable'
+    steps:
+      - name: checkout product backup (deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: 694410194/mino-agent
+          ssh-key: ${{ secrets.MAC_BUILD_SSH_KEY }}
+          ssh-known-hosts: ${{ secrets.MAC_BUILD_KNOWN_HOSTS }}
+          path: backup
+
+      - name: reconstruct product source (BASE + format-patch)
+        shell: bash
+        run: |
+          set -e
+          BASE=$(cat backup/BASE)
+          mkdir src && cd src
+          git init -q .
+          git remote add upstream https://github.com/deepseek-ai/deepseek-harness.git
+          git fetch --depth=1 -q upstream "$BASE"
+          git checkout -q FETCH_HEAD
+          git -c user.name=wuyangji -c user.email=694410194@qq.com am -q ../backup/patches/*.patch
+          git remote add fork https://github.com/694410194/mino-agent.git
+          echo "reconstructed: $(git log -1 --format='%h %s') | $(git ls-files | wc -l | tr -d ' ') files"
+
+      - name: checkout mino-plugins
+        uses: actions/checkout@v4
+        with:
+          repository: 694410194/mino-plugins
+          ref: ${{ inputs.plugins_ref }}
+          path: mino-plugins
+
+      - uses: pnpm/action-setup@v4
+        with:
+          # 钉死 v11：lockfile 口径与仓根 packageManager 一致；v12 会静默跳过重算
+          version: 11.28.5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+          cache-dependency-path: |
+            src/pnpm-lock.yaml
+            mino-plugins/pnpm-lock.yaml
+
+      - name: install workspace deps
+        shell: bash
+        run: |
+          set -e
+          pnpm --dir src install --frozen-lockfile
+          pnpm --dir mino-plugins install --frozen-lockfile
+
+      - name: apply esbuild stdin patch
+        shell: bash
+        run: |
+          cd src
+          n=0
+          for f in node_modules/.pnpm/esbuild@*/node_modules/esbuild/lib/main.js; do
+            [ -f "$f" ] || continue
+            sed -i 's/input\.length > 1024 \* 1024)/input.length > 1024 * 1024 * 1024)/' "$f" && n=$((n+1))
+          done
+          echo "esbuild patched: $n file(s)"
+          [ "$n" -gt 0 ]
+
+      - name: write .env.windows (non-secret release config)
+        shell: bash
+        run: |
+          printf '%s\n' \
+            'DSH_DESKTOP_APP_ID=baby.mino.desktop' \
+            'DSH_DESKTOP_AUTO_UPDATE_ENV=production' \
+            'DOWNLOAD_TEST_ORIGIN=' \
+            'DOWNLOAD_TEST_RELEASE_ID=' \
+            'DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://mino.baby' \
+            'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://mino.baby' \
+            "DSH_DESKTOP_MANDATORY_UPDATE_CONFIG='{}'" \
+            'DSH_DESKTOP_WINDOWS_SIGNATURE_CACHE_CONCURRENCY=4' \
+            'DSH_DESKTOP_WINDOWS_COMPRESSION_LEVEL=3' \
+            > src/apps/desktop/.env.windows
+
+      - name: package win-x64 unsigned
+        working-directory: src
+        env:
+          MINO_PLUGINS_DIR: ${{ github.workspace }}/mino-plugins
+        run: pnpm --dir apps/desktop run package:win:x64:unsigned
+
+      - name: verify artifacts
+        shell: bash
+        run: |
+          ART=src/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts
+          ls -lh "$ART"
+          ls "$ART"/*.exe "$ART"/*.blockmap "$ART"/stable.yml >/dev/null || { echo "artifacts incomplete in $ART"; exit 1; }
+          grep -q '^version: ' "$ART/stable.yml" || { echo "stable.yml malformed"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mino-win-x64-unsigned-${{ github.run_id }}
+          path: src/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*
+          retention-days: 30
+          if-no-files-found: error
+
+  publish:
+    # 发布 = 构建产物改名进本仓 v<version> release。exe 按官网约定改名 Mino-Setup-<v>.exe；
+    # blockmap/通道 yml 保构建名。同名资产覆盖前注意：已发布版本只允许追加新资产。
+    if: inputs.publish
+    needs: win-x64-unsigned
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: mino-win-x64-unsigned-${{ github.run_id }}
+          path: dist
+
+      - name: stage release assets
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -e
+          [ -n "$VERSION" ] || { echo "publish requires version input"; exit 1; }
+          grep -qx "version: $VERSION" dist/stable.yml \
+            || { echo "stable.yml 版本与输入不符，拒绝发布"; cat dist/stable.yml; exit 1; }
+          mkdir rel
+          cp dist/*.exe "rel/Mino-Setup-${VERSION}.exe"
+          cp dist/*.blockmap dist/stable.yml rel/
+          cp dist/stable.yml rel/nightly.yml
+          ls -lh rel
+
+      - name: upload assets and publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -e
+          TAG="v${VERSION}"
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --draft --title "Mino $VERSION" --notes "Mino $VERSION 桌面安装包"
+          declare -A WANT=()
+          for f in rel/*; do WANT["$(basename "$f")"]=$(sha256sum "$f" | cut -d' ' -f1); done
+          for f in rel/*; do gh release upload "$TAG" "$f" --clobber; done
+          sleep 5
+          for name in "${!WANT[@]}"; do
+            got=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" \
+              --jq ".assets[] | select(.name==\"$name\") | .digest" | sed 's/sha256://')
+            [ "$got" = "${WANT[$name]}" ] || { echo "digest mismatch: $name"; exit 1; }
+          done
+          gh release edit "$TAG" --draft=false

@@ -1,0 +1,187 @@
+name: mac-build
+# Mino macOS unsigned 发布构建——mino-deploy scripts/build-win-x64-release.sh 的 macOS 对应物。
+# 本仓（mino-releases）= 桌面端构建+发布的唯一收口：公仓吃免费 runner；产品源码不公开——
+# deploy key（mino-agent 仓只读部署密钥）checkout 私仓备份（BASE + format-patch），
+# 再与公开上游重建产品树。secrets 只存私钥，日志全程掩码。
+# 环境口径与 win 一致：ELECTRON_MIRROR / DSH_DESKTOP_UPDATE_CHANNEL=stable / MINO_PLUGINS_DIR。
+# .env.macos 由 workflow 内联写入（无非密）：baby.mino.desktop appId + production
+# 更新面——产物是 Mino 品牌 unsigned 包（dmg 下载用 + zip 更新用 + stable-mac.yml feed）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      plugins_ref:
+        description: 'mino-plugins ref（分支或 commit）'
+        required: false
+        default: 'main'
+      publish:
+        description: '构建后把资产上传 v<version> release（同名覆盖）'
+        required: false
+        type: boolean
+        default: false
+      version:
+        description: '发布版本号（publish 时必填，须与产物版本一致）'
+        required: false
+        default: ''
+
+jobs:
+  mac-arm64-unsigned:
+    runs-on: macos-15
+    timeout-minutes: 150
+    env:
+      ELECTRON_MIRROR: 'https://npmmirror.com/mirrors/electron/'
+      DSH_DESKTOP_UPDATE_CHANNEL: 'stable'
+    steps:
+      - name: checkout product backup (deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: 694410194/mino-agent
+          ssh-key: ${{ secrets.MAC_BUILD_SSH_KEY }}
+          ssh-known-hosts: ${{ secrets.MAC_BUILD_KNOWN_HOSTS }}
+          path: backup
+
+      - name: reconstruct product source (BASE + format-patch)
+        run: |
+          set -e
+          BASE=$(cat backup/BASE)
+          mkdir src && cd src
+          git init -q .
+          git remote add upstream https://github.com/deepseek-ai/deepseek-harness.git
+          git fetch --depth=1 -q upstream "$BASE"
+          git checkout -q FETCH_HEAD
+          git -c user.name=wuyangji -c user.email=694410194@qq.com am -q ../backup/patches/*.patch
+          git remote add fork https://github.com/694410194/mino-agent.git
+          echo "reconstructed: $(git log -1 --format='%h %s') | $(git ls-files | wc -l | tr -d ' ') files"
+
+      - name: checkout mino-plugins
+        uses: actions/checkout@v4
+        with:
+          repository: 694410194/mino-plugins
+          ref: ${{ inputs.plugins_ref }}
+          path: mino-plugins
+
+      - uses: pnpm/action-setup@v4
+        with:
+          # 钉死 v11：lockfile 口径与仓根 packageManager 一致；v12 会静默跳过重算
+          version: 11.28.5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+          cache-dependency-path: |
+            src/pnpm-lock.yaml
+            mino-plugins/pnpm-lock.yaml
+
+      - name: install workspace deps
+        run: |
+          set -e
+          pnpm --dir src install --frozen-lockfile
+          pnpm --dir mino-plugins install --frozen-lockfile
+
+      - name: apply esbuild stdin patch
+        run: |
+          cd src
+          n=0
+          for f in node_modules/.pnpm/esbuild@*/node_modules/esbuild/lib/main.js; do
+            [ -f "$f" ] || continue
+            sed -i '' 's/input\.length > 1024 \* 1024)/input.length > 1024 * 1024 * 1024)/' "$f" && n=$((n+1))
+          done
+          echo "esbuild patched: $n file(s)"
+          [ "$n" -gt 0 ]
+
+      - name: write .env.macos (non-secret release config)
+        # 有了 .env.macos，unsigned 构建走 loadDesktopPackageEnvironment：
+        # baby.mino.desktop appId + production 更新面（feed 嵌入 zip 产物）。
+        run: |
+          printf '%s\n' \
+            'DSH_DESKTOP_APP_ID=baby.mino.desktop' \
+            'DSH_DESKTOP_AUTO_UPDATE_ENV=production' \
+            'DOWNLOAD_TEST_ORIGIN=' \
+            'DOWNLOAD_TEST_RELEASE_ID=' \
+            'DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://mino.baby' \
+            'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://mino.baby' \
+            "DSH_DESKTOP_MANDATORY_UPDATE_CONFIG='{}'" \
+            'DSH_DESKTOP_MACOS_PACK_CONCURRENCY=4' \
+            'DSH_DESKTOP_MACOS_ZIP_COMPRESSION_LEVEL=3' \
+            > src/apps/desktop/.env.macos
+
+      - name: render macOS icon at 1024
+        # electron-builder mac 闸门 ≥512px；备份仓 patch 尚未带 1024 重渲染版，
+        # 此处从 resources/icon-macos.svg 矢真理现渲，备份同步后此步自然幂等。
+        working-directory: src/apps/desktop
+        run: |
+          node -e "import('sharp').then(async ({default:sharp})=>{const fs=await import('fs');const svg=fs.readFileSync('resources/icon-macos.svg');await sharp(svg,{density:72}).resize(1024,1024).png().toFile('resources/icon-macos.png');const b=fs.readFileSync('resources/icon-macos.png');console.log('icon-macos.png',b.readUInt32BE(16)+'x'+b.readUInt32BE(20));if(b.readUInt32BE(16)<512)process.exit(1)})"
+
+      - name: package mac-arm64 unsigned
+        working-directory: src
+        env:
+          MINO_PLUGINS_DIR: ${{ github.workspace }}/mino-plugins
+        run: pnpm --dir apps/desktop run package:mac:arm64:unsigned
+
+      - name: verify artifacts
+        working-directory: src
+        run: |
+          ART=apps/desktop/.desktop-build/targets/mac-arm64/unsigned-artifacts
+          ls -lh "$ART"
+          ls "$ART"/*.dmg "$ART"/*.zip "$ART"/*.blockmap "$ART"/stable-mac.yml >/dev/null || { echo "artifacts incomplete in $ART"; exit 1; }
+          grep -q '^version: ' "$ART"/stable-mac.yml || { echo "stable-mac.yml malformed"; exit 1; }
+          # feed URL 嵌在 app 内的 app-update.yml，不在通道清单里
+          unzip -p "$ART"/*.zip 'Mino.app/Contents/Resources/app-update.yml' 2>/dev/null \
+            | grep -q 'download.mino.baby/dsh-desk/feeds/mac-arm64' \
+            || { echo "app-update.yml missing production feed"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mino-mac-arm64-unsigned-${{ github.run_id }}
+          path: src/apps/desktop/.desktop-build/targets/mac-arm64/unsigned-artifacts/*
+          retention-days: 30
+          if-no-files-found: error
+
+  publish:
+    # 发布 = 构建产物改名进本仓 v<version> release。同仓 GITHUB_TOKEN 直传，零跨仓凭据。
+    # dmg 按官网约定改名 Mino-Setup-<v>.dmg；zip/blockmap/通道 yml 保构建名（yml 内部互引）。
+    if: inputs.publish
+    needs: mac-arm64-unsigned
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: mino-mac-arm64-unsigned-${{ github.run_id }}
+          path: dist
+
+      - name: stage release assets
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -e
+          [ -n "$VERSION" ] || { echo "publish requires version input"; exit 1; }
+          grep -qx "version: $VERSION" dist/stable-mac.yml \
+            || { echo "stable-mac.yml 版本与输入不符，拒绝发布"; cat dist/stable-mac.yml; exit 1; }
+          mkdir rel
+          cp dist/*.dmg "rel/Mino-Setup-${VERSION}.dmg"
+          cp dist/*.zip dist/*.blockmap dist/stable-mac.yml rel/
+          cp dist/stable-mac.yml rel/nightly-mac.yml
+          ls -lh rel
+
+      - name: upload assets and publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -e
+          TAG="v${VERSION}"
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --draft --title "Mino $VERSION" --notes "Mino $VERSION 桌面安装包"
+          declare -A WANT=()
+          for f in rel/*; do WANT["$(basename "$f")"]=$(sha256sum "$f" | cut -d' ' -f1); done
+          for f in rel/*; do gh release upload "$TAG" "$f" --clobber; done
+          sleep 5
+          for name in "${!WANT[@]}"; do
+            got=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" \
+              --jq ".assets[] | select(.name==\"$name\") | .digest" | sed 's/sha256://')
+            [ "$got" = "${WANT[$name]}" ] || { echo "digest mismatch: $name"; exit 1; }
+          done
+          gh release edit "$TAG" --draft=false
