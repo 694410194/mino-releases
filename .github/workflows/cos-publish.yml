@@ -149,6 +149,8 @@ jobs:
           done
           [ "$MISSING" -eq 0 ] || exit 1
           # 远端清理：只删本平台域内、且不在本版键集的对象，沿用 MAX_PRUNE 闸。
+          # ls 行锚 = TYPE 列全大写类名+LAST MODIFIED 以年份开头（coscli 输出没有 FILE 字样，
+          # 曾经按 \| FILE \| 过滤的写法匹配恒为空——剪枝形同虚设）。
           MAX_PRUNE=10
           RPRUNE=()
           while IFS= read -r obj; do
@@ -157,7 +159,7 @@ jobs:
             owns_key "$obj" || continue
             RPRUNE+=("$obj")
           done < <("${COS[@]}" ls "$B/" -r \
-            | awk -F'|' '/\| FILE \|/ {gsub(/^ +| +$/,"",$1); print $1}')
+            | awk -F'|' '$2 ~ /^ *[A-Z_]+ *$/ && $3 ~ /^ *[0-9]{4}-/ {gsub(/^ +| +$/,"",$1); print $1}')
           if (( ${#RPRUNE[@]} > MAX_PRUNE )); then
             echo "本平台域内过期对象数 ${#RPRUNE[@]} 超过 MAX_PRUNE=$MAX_PRUNE，未删除：" >&2
             printf '  %s\n' "${RPRUNE[@]}" >&2
