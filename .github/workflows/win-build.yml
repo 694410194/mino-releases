@@ -182,3 +182,16 @@ jobs:
             [ "$got" = "${WANT[$name]}" ] || { echo "digest mismatch: $name"; exit 1; }
           done
           gh release edit "$TAG" --draft=false
+
+  cos-publish:
+    # 发布后镜像到私有 COS+刷 CDN（去服务器 cron 后的分发面）。可复用实现见
+    # cos-publish.yml；cos-push-test 可无构建独立演练同一条代码路径。
+    needs: publish
+    if: inputs.publish
+    uses: ./.github/workflows/cos-publish.yml
+    permissions:
+      contents: write
+    with:
+      version: ${{ inputs.version }}
+      platform: win
+    secrets: inherit
